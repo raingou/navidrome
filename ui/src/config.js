@@ -14,6 +14,7 @@ const defaultConfig = {
   enableFavourites: true,
   losslessFormats: 'FLAC,WAV,ALAC,DSF',
   welcomeMessage: '',
+  onlineMusicURL: '',
   gaTrackingId: '',
   devActivityPanel: true,
   enableStarRating: true,

@@ -51,6 +51,7 @@ type configOptions struct {
 	TLSKey                          string
 	UILoginBackgroundURL            string
 	UIWelcomeMessage                string
+	UIOnlineMusicURL               string
 	MaxSidebarPlaylists             int
 	EnableTranscodingConfig         bool
 	EnableDownloads                 bool
