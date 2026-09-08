@@ -55,14 +55,26 @@ const Menu = ({ dense = false }) => {
 
   // TODO State is not persisted in mobile when you close the sidebar menu. Move to redux?
   const [state, setState] = useState({
-    menuAlbumList: true,
-    menuPlaylists: true,
-    menuSharedPlaylists: true,
+    menuAlbumList: false,
+    menuPlaylists: false,
+    menuSharedPlaylists: false,
   })
 
   const handleToggle = (menu) => {
-    setState((state) => ({ ...state, [menu]: !state[menu] }))
+    setState((current) => ({
+      menuAlbumList: menu === 'menuAlbumList' && !current.menuAlbumList,
+      menuPlaylists: menu === 'menuPlaylists' && !current.menuPlaylists,
+      menuSharedPlaylists:
+        menu === 'menuSharedPlaylists' && !current.menuSharedPlaylists,
+    }))
   }
+
+  const collapseAll = () =>
+    setState({
+      menuAlbumList: false,
+      menuPlaylists: false,
+      menuSharedPlaylists: false,
+    })
 
   const renderResourceMenuItemLink = (resource) => (
     <MenuItemLink
@@ -73,6 +85,7 @@ const Menu = ({ dense = false }) => {
       leftIcon={resource.icon || <ViewListIcon />}
       sidebarIsOpen={open}
       dense={dense}
+      onClick={collapseAll}
     />
   )
 
@@ -131,7 +144,7 @@ const Menu = ({ dense = false }) => {
           <Divider />
           <PlaylistsSubMenu
             state={state}
-            setState={setState}
+            handleToggle={handleToggle}
             sidebarIsOpen={open}
             dense={dense}
           />

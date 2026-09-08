@@ -56,7 +56,7 @@ const PlaylistMenuItemLink = ({ pls, sidebarIsOpen }) => {
   )
 }
 
-const PlaylistsSubMenu = ({ state, setState, sidebarIsOpen, dense }) => {
+const PlaylistsSubMenu = ({ state, handleToggle, sidebarIsOpen, dense }) => {
   const history = useHistory()
   const dispatch = useDispatch()
   const translate = useTranslate()
@@ -105,10 +105,6 @@ const PlaylistsSubMenu = ({ state, setState, sidebarIsOpen, dense }) => {
       }),
     },
   })
-
-  const handleToggle = (menu) => {
-    setState((state) => ({ ...state, [menu]: !state[menu] }))
-  }
 
   const renderPlaylistMenuItemLink = (pls) => (
     <PlaylistMenuItemLink

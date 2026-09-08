@@ -57,7 +57,8 @@ const useStyles = makeStyles(
       width: 360,
       maxWidth: '38vw',
       height: 38,
-      marginLeft: theme.spacing(2),
+      marginLeft: 0,
+      marginRight: 0,
       paddingLeft: theme.spacing(1.5),
       borderRadius: 19,
       background: 'rgba(255,255,255,.16)',
@@ -78,6 +79,23 @@ const useStyles = makeStyles(
     onlineCover: { width: 42, height: 42, borderRadius: 4, objectFit: 'cover' },
     onlineActions: { whiteSpace: 'nowrap' },
     onlineMessage: { padding: theme.spacing(4), textAlign: 'center' },
+    headerLayout: {
+      display: 'grid',
+      gridTemplateColumns: 'minmax(80px, 1fr) minmax(240px, 420px) minmax(80px, 1fr)',
+      alignItems: 'center',
+      flex: 1,
+      minWidth: 0,
+      [theme.breakpoints.down('sm')]: {
+        gridTemplateColumns: '60px minmax(150px, 1fr) 8px',
+      },
+    },
+    systemName: {
+      paddingLeft: theme.spacing(1),
+      fontSize: 20,
+      fontWeight: 600,
+      whiteSpace: 'nowrap',
+      [theme.breakpoints.down('sm')]: { fontSize: 16 },
+    },
   }),
   {
     name: 'NDAppBar',
@@ -220,6 +238,17 @@ const OnlineMusicSearch = () => {
   )
 }
 
+const HeaderContent = () => {
+  const classes = useStyles()
+  return (
+    <div className={classes.headerLayout}>
+      <span className={classes.systemName}>音乐</span>
+      <OnlineMusicSearch />
+      <span />
+    </div>
+  )
+}
+
 const AboutMenuItem = forwardRef(({ onClick, ...rest }, ref) => {
   const classes = useStyles(rest)
   const translate = useTranslate()
@@ -327,8 +356,12 @@ const CustomUserMenu = ({ onClick, ...rest }) => {
 }
 
 const AppBar = (props) => (
-  <RAAppBar {...props} container={Fragment} userMenu={<CustomUserMenu />}>
-    <OnlineMusicSearch />
+  <RAAppBar
+    {...props}
+    container={Fragment}
+    userMenu={<CustomUserMenu />}
+  >
+    <HeaderContent />
   </RAAppBar>
 )
 
