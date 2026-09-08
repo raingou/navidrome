@@ -17,9 +17,20 @@ import {
   IconButton,
   InputBase,
   Tooltip,
+  Button,
+  CircularProgress,
+  DialogContent,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
 } from '@material-ui/core'
 import CloseIcon from '@material-ui/icons/Close'
 import SearchIcon from '@material-ui/icons/Search'
+import PlayArrowIcon from '@material-ui/icons/PlayArrow'
+import StopIcon from '@material-ui/icons/Stop'
+import GetAppIcon from '@material-ui/icons/GetApp'
 import ViewListIcon from '@material-ui/icons/ViewList'
 import { Dialogs } from '../dialogs/Dialogs'
 import { AboutDialog } from '../dialogs'
@@ -28,6 +39,8 @@ import ActivityPanel from './ActivityPanel'
 import NowPlayingPanel from './NowPlayingPanel'
 import UserMenu from './UserMenu'
 import config from '../config'
+import httpClient from '../dataProvider/httpClient'
+import { baseUrl } from '../utils'
 
 const useStyles = makeStyles(
   (theme) => ({
@@ -61,7 +74,10 @@ const useStyles = makeStyles(
       borderBottom: `1px solid ${theme.palette.divider}`,
     },
     onlineDialogTitle: { flex: 1, fontWeight: 600 },
-    onlineFrame: { width: '100%', height: 'calc(92vh - 49px)', border: 0 },
+    onlineContent: { padding: 0, overflow: 'auto' },
+    onlineCover: { width: 42, height: 42, borderRadius: 4, objectFit: 'cover' },
+    onlineActions: { whiteSpace: 'nowrap' },
+    onlineMessage: { padding: theme.spacing(4), textAlign: 'center' },
   }),
   {
     name: 'NDAppBar',
@@ -72,16 +88,77 @@ const OnlineMusicSearch = () => {
   const classes = useStyles()
   const [query, setQuery] = React.useState('')
   const [open, setOpen] = React.useState(false)
-  if (!config.onlineMusicURL) return null
+  const [loading, setLoading] = React.useState(false)
+  const [items, setItems] = React.useState([])
+  const [error, setError] = React.useState('')
+  const [playingId, setPlayingId] = React.useState(null)
+  const [importingId, setImportingId] = React.useState(null)
+  const audio = React.useRef(null)
 
-  const search = (event) => {
+  const search = async (event) => {
     event.preventDefault()
-    if (query.trim()) setOpen(true)
+    if (!query.trim()) return
+    setOpen(true)
+    setLoading(true)
+    setError('')
+    try {
+      const response = await httpClient(
+        `/api/online-music/search?q=${encodeURIComponent(query.trim())}`,
+      )
+      setItems(response.json?.items || [])
+    } catch (searchError) {
+      setItems([])
+      setError(searchError?.message || '在线搜索失败')
+    } finally {
+      setLoading(false)
+    }
   }
-  const separator = config.onlineMusicURL.includes('?') ? '&' : '?'
-  const src = `${config.onlineMusicURL}${separator}embed=1&q=${encodeURIComponent(
-    query.trim(),
-  )}`
+
+  const togglePlay = (item) => {
+    if (playingId === item.id) {
+      audio.current?.pause()
+      setPlayingId(null)
+      return
+    }
+    audio.current?.pause()
+    const token = localStorage.getItem('token') || ''
+    const player = new Audio(
+      baseUrl(
+        `/api/online-music/stream?id=${encodeURIComponent(
+          item.id,
+        )}&jwt=${encodeURIComponent(token)}`,
+      ),
+    )
+    player.addEventListener('ended', () => setPlayingId(null), { once: true })
+    audio.current = player
+    setPlayingId(item.id)
+    player.play().catch(() => {
+      setPlayingId(null)
+      setError('该歌曲暂时无法试听')
+    })
+  }
+
+  const importSong = async (item) => {
+    setImportingId(item.id)
+    setError('')
+    try {
+      await httpClient('/api/online-music/import', {
+        method: 'POST',
+        body: JSON.stringify(item),
+        headers: new Headers({ 'Content-Type': 'application/json' }),
+      })
+    } catch (importError) {
+      setError(importError?.message || '下载入库失败，请检查音乐目录写入权限')
+    } finally {
+      setImportingId(null)
+    }
+  }
+
+  const close = () => {
+    audio.current?.pause()
+    setPlayingId(null)
+    setOpen(false)
+  }
 
   return (
     <>
@@ -103,16 +180,41 @@ const OnlineMusicSearch = () => {
         fullWidth
         maxWidth="lg"
         open={open}
-        onClose={() => setOpen(false)}
+        onClose={close}
         PaperProps={{ className: classes.onlineDialog }}
       >
         <div className={classes.onlineDialogHead}>
           <span className={classes.onlineDialogTitle}>在线音乐搜索</span>
-          <IconButton onClick={() => setOpen(false)} aria-label="关闭">
+          <IconButton onClick={close} aria-label="关闭">
             <CloseIcon />
           </IconButton>
         </div>
-        <iframe className={classes.onlineFrame} src={src} title="在线音乐搜索" />
+        <DialogContent className={classes.onlineContent}>
+          {loading ? (
+            <div className={classes.onlineMessage}><CircularProgress /></div>
+          ) : error && items.length === 0 ? (
+            <div className={classes.onlineMessage}>{error}</div>
+          ) : items.length === 0 ? (
+            <div className={classes.onlineMessage}>没有找到相关歌曲</div>
+          ) : (
+            <Table stickyHeader size="small">
+              <TableHead><TableRow><TableCell>封面</TableCell><TableCell>歌曲</TableCell><TableCell>歌手</TableCell><TableCell>专辑</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
+              <TableBody>
+                {items.map((item) => (
+                  <TableRow hover key={item.id}>
+                    <TableCell>{item.cover ? <img className={classes.onlineCover} src={item.cover} alt="" /> : null}</TableCell>
+                    <TableCell>{item.title}</TableCell><TableCell>{item.artist}</TableCell><TableCell>{item.album}</TableCell>
+                    <TableCell align="right" className={classes.onlineActions}>
+                      <Tooltip title={playingId === item.id ? '停止试听' : '在线试听'}><IconButton onClick={() => togglePlay(item)}>{playingId === item.id ? <StopIcon /> : <PlayArrowIcon />}</IconButton></Tooltip>
+                      <Button size="small" startIcon={importingId === item.id ? <CircularProgress size={16} /> : <GetAppIcon />} disabled={importingId !== null} onClick={() => importSong(item)}>下载入库</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+          {error && items.length > 0 ? <div className={classes.onlineMessage}>{error}</div> : null}
+        </DialogContent>
       </Dialog>
     </>
   )
