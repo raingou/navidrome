@@ -89,7 +89,10 @@ const useStyles = makeStyles(
     onlineMessage: { padding: theme.spacing(4), textAlign: 'center' },
     headerLayout: {
       display: 'grid',
-      gridTemplateColumns: 'minmax(80px, 1fr) minmax(240px, 420px) minmax(80px, 1fr)',
+      gridTemplateColumns: (props) =>
+        props.sidebarOpen
+          ? '290px minmax(300px, 420px) minmax(40px, 1fr)'
+          : '40px minmax(300px, 420px) minmax(40px, 1fr)',
       alignItems: 'center',
       flex: 1,
       minWidth: 0,
@@ -264,7 +267,8 @@ const OnlineMusicSearch = () => {
 }
 
 const HeaderContent = () => {
-  const classes = useStyles()
+  const sidebarOpen = useSelector((state) => state.admin.ui.sidebarOpen)
+  const classes = useStyles({ sidebarOpen })
   return (
     <div className={classes.headerLayout}>
       <span className={classes.systemName}>音乐</span>
