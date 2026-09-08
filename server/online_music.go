@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/model"
 )
 
 const onlineMusicAPIPath = "/api/online-music"
@@ -30,6 +31,7 @@ var onlineMusicClient = &http.Client{
 	CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 }
 var unsafeFilenameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
+var playlistMatchSeparators = regexp.MustCompile(`[^\p{L}\p{N}]+`)
 
 type onlineSong struct {
 	ID       string `json:"id"`
@@ -49,17 +51,122 @@ type importOnlineSongRequest struct {
 	Provider string `json:"provider"`
 }
 
+type playlistImportTrack struct {
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Path   string `json:"path,omitempty"`
+}
+
+type playlistImportRequest struct {
+	Name   string                `json:"name"`
+	Tracks []playlistImportTrack `json:"tracks"`
+}
+
 func (s *Server) MountOnlineMusicRouter() {
 	router := chi.NewRouter()
 	router.Get("/search", onlineMusicSearch)
 	router.Get("/stream", onlineMusicStream)
 	router.Get("/lyrics", onlineMusicLyrics)
 	router.Post("/import", onlineMusicImport)
+	router.Post("/playlist-match", s.onlinePlaylistMatch)
+	router.Post("/playlist-import", onlinePlaylistImport)
 	s.router.Group(func(r chi.Router) {
 		r.Use(Authenticator(s.ds))
 		r.Use(JWTRefresher)
 		r.Mount(filepath.ToSlash(filepath.Join(conf.Server.BasePath, onlineMusicAPIPath)), router)
 	})
+}
+
+func (s *Server) onlinePlaylistMatch(w http.ResponseWriter, r *http.Request) {
+	var payload playlistImportRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&payload) != nil || len(payload.Tracks) == 0 {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid playlist"})
+		return
+	}
+	if len(payload.Tracks) > 1000 {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "playlist is too large"})
+		return
+	}
+	result := make([]map[string]any, 0, len(payload.Tracks))
+	for _, requested := range payload.Tracks {
+		query := strings.TrimSpace(requested.Title + " " + requested.Artist)
+		matches, err := s.ds.MediaFile(r.Context()).Search(query, model.QueryOptions{Max: 8})
+		var best *model.MediaFile
+		bestScore := -1
+		if err == nil {
+			for i := range matches {
+				score := playlistMatchScore(requested, matches[i])
+				if score > bestScore {
+					best, bestScore = &matches[i], score
+				}
+			}
+		}
+		item := map[string]any{"title": requested.Title, "artist": requested.Artist, "matched": false}
+		if best != nil && bestScore >= 60 {
+			item["matched"] = true
+			item["path"] = best.Path
+			item["localTitle"] = best.Title
+			item["localArtist"] = best.Artist
+		}
+		result = append(result, item)
+	}
+	writeOnlineJSON(w, http.StatusOK, map[string]any{"name": payload.Name, "tracks": result})
+}
+
+func playlistMatchScore(requested playlistImportTrack, candidate model.MediaFile) int {
+	norm := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		return strings.Join(strings.Fields(playlistMatchSeparators.ReplaceAllString(value, " ")), " ")
+	}
+	title, candidateTitle := norm(requested.Title), norm(candidate.Title)
+	artist, candidateArtist := norm(requested.Artist), norm(candidate.Artist)
+	score := 0
+	if title != "" && title == candidateTitle {
+		score += 70
+	} else if title != "" && (strings.Contains(candidateTitle, title) || strings.Contains(title, candidateTitle)) {
+		score += 45
+	}
+	if artist != "" && artist == candidateArtist {
+		score += 30
+	} else if artist != "" && (strings.Contains(candidateArtist, artist) || strings.Contains(artist, candidateArtist)) {
+		score += 15
+	}
+	return score
+}
+
+func onlinePlaylistImport(w http.ResponseWriter, r *http.Request) {
+	var payload playlistImportRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&payload) != nil || len(payload.Tracks) == 0 {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid playlist"})
+		return
+	}
+	name := safeOnlineName(payload.Name, "Imported Playlist")
+	directory := filepath.Join(conf.Server.MusicFolder, "Imported Playlists")
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "music folder is not writable"})
+		return
+	}
+	var content strings.Builder
+	content.WriteString("#EXTM3U\n")
+	count := 0
+	for _, track := range payload.Tracks {
+		trackPath := filepath.Clean(strings.TrimSpace(track.Path))
+		if trackPath == "." || filepath.IsAbs(trackPath) || strings.HasPrefix(trackPath, "..") {
+			continue
+		}
+		content.WriteString(filepath.ToSlash(filepath.Join("..", trackPath)) + "\n")
+		count++
+	}
+	if count == 0 {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "playlist has no matched tracks"})
+		return
+	}
+	filename := filepath.Join(directory, name+".m3u8")
+	if err := os.WriteFile(filename, []byte(content.String()), 0644); err != nil {
+		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "saving playlist failed"})
+		return
+	}
+	writeOnlineJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name, "tracks": count, "file": filepath.ToSlash(filepath.Join("Imported Playlists", name+".m3u8"))})
 }
 
 func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
