@@ -25,6 +25,7 @@ import {
   TableCell,
   TableHead,
   TableRow,
+  Select,
 } from '@material-ui/core'
 import CloseIcon from '@material-ui/icons/Close'
 import SearchIcon from '@material-ui/icons/Search'
@@ -66,6 +67,13 @@ const useStyles = makeStyles(
       [theme.breakpoints.down('sm')]: { width: 190, maxWidth: '42vw' },
     },
     onlineInput: { flex: 1, color: 'inherit', fontSize: 14 },
+    providerSelect: {
+      color: 'inherit',
+      fontSize: 13,
+      marginRight: theme.spacing(1),
+      '&:before, &:after': { display: 'none' },
+      '& .MuiSelect-icon': { color: 'inherit' },
+    },
     onlineDialog: { height: '92vh', maxHeight: '92vh' },
     onlineDialogHead: {
       display: 'flex',
@@ -105,6 +113,7 @@ const useStyles = makeStyles(
 const OnlineMusicSearch = () => {
   const classes = useStyles()
   const [query, setQuery] = React.useState('')
+  const [provider, setProvider] = React.useState('all')
   const [open, setOpen] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
   const [items, setItems] = React.useState([])
@@ -121,7 +130,9 @@ const OnlineMusicSearch = () => {
     setError('')
     try {
       const response = await httpClient(
-        `/api/online-music/search?q=${encodeURIComponent(query.trim())}`,
+        `/api/online-music/search?q=${encodeURIComponent(
+          query.trim(),
+        )}&provider=${encodeURIComponent(provider)}`,
       )
       setItems(response.json?.items || [])
     } catch (searchError) {
@@ -144,7 +155,9 @@ const OnlineMusicSearch = () => {
       baseUrl(
         `/api/online-music/stream?id=${encodeURIComponent(
           item.id,
-        )}&jwt=${encodeURIComponent(token)}`,
+        )}&provider=${encodeURIComponent(item.provider)}&jwt=${encodeURIComponent(
+          token,
+        )}`,
       ),
     )
     player.addEventListener('ended', () => setPlayingId(null), { once: true })
@@ -181,6 +194,18 @@ const OnlineMusicSearch = () => {
   return (
     <>
       <form className={classes.onlineSearch} onSubmit={search}>
+        <Select
+          native
+          className={classes.providerSelect}
+          value={provider}
+          onChange={(event) => setProvider(event.target.value)}
+          inputProps={{ 'aria-label': '音乐来源' }}
+        >
+          <option value="all">全部来源</option>
+          <option value="netease">网易云</option>
+          <option value="qq">QQ音乐</option>
+          <option value="kugou">酷狗</option>
+        </Select>
         <InputBase
           className={classes.onlineInput}
           value={query}
@@ -216,12 +241,12 @@ const OnlineMusicSearch = () => {
             <div className={classes.onlineMessage}>没有找到相关歌曲</div>
           ) : (
             <Table stickyHeader size="small">
-              <TableHead><TableRow><TableCell>封面</TableCell><TableCell>歌曲</TableCell><TableCell>歌手</TableCell><TableCell>专辑</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
+              <TableHead><TableRow><TableCell>封面</TableCell><TableCell>歌曲</TableCell><TableCell>歌手</TableCell><TableCell>专辑</TableCell><TableCell>来源</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
               <TableBody>
                 {items.map((item) => (
                   <TableRow hover key={item.id}>
                     <TableCell>{item.cover ? <img className={classes.onlineCover} src={item.cover} alt="" /> : null}</TableCell>
-                    <TableCell>{item.title}</TableCell><TableCell>{item.artist}</TableCell><TableCell>{item.album}</TableCell>
+                    <TableCell>{item.title}</TableCell><TableCell>{item.artist}</TableCell><TableCell>{item.album}</TableCell><TableCell>{{ netease: '网易云', qq: 'QQ音乐', kugou: '酷狗' }[item.provider] || item.provider}</TableCell>
                     <TableCell align="right" className={classes.onlineActions}>
                       <Tooltip title={playingId === item.id ? '停止试听' : '在线试听'}><IconButton onClick={() => togglePlay(item)}>{playingId === item.id ? <StopIcon /> : <PlayArrowIcon />}</IconButton></Tooltip>
                       <Button size="small" startIcon={importingId === item.id ? <CircularProgress size={16} /> : <GetAppIcon />} disabled={importingId !== null} onClick={() => importSong(item)}>下载入库</Button>

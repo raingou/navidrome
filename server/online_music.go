@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -36,13 +38,15 @@ type onlineSong struct {
 	Album    string `json:"album"`
 	Cover    string `json:"cover,omitempty"`
 	Duration int64  `json:"duration,omitempty"`
+	Provider string `json:"provider"`
 }
 
 type importOnlineSongRequest struct {
-	ID     string `json:"id"`
-	Title  string `json:"title"`
-	Artist string `json:"artist"`
-	Album  string `json:"album"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album"`
+	Provider string `json:"provider"`
 }
 
 func (s *Server) MountOnlineMusicRouter() {
@@ -68,6 +72,53 @@ func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 	if limit < 1 || limit > 50 {
 		limit = 20
 	}
+	provider := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
+	if provider == "" {
+		provider = "all"
+	}
+	providers := []string{provider}
+	if provider == "all" {
+		providers = []string{"netease", "qq", "kugou"}
+	}
+	type result struct{ items []onlineSong }
+	results := make(chan result, len(providers))
+	var wait sync.WaitGroup
+	for _, source := range providers {
+		wait.Add(1)
+		go func(source string) {
+			defer wait.Done()
+			items, _ := searchOnlineProvider(r, source, query, limit)
+			results <- result{items: items}
+		}(source)
+	}
+	wait.Wait()
+	close(results)
+	items := make([]onlineSong, 0, limit*len(providers))
+	seen := map[string]bool{}
+	for result := range results {
+		for _, item := range result.items {
+			key := item.Provider + "|" + strings.ToLower(strings.TrimSpace(item.Title)) + "|" + strings.ToLower(strings.TrimSpace(item.Artist))
+			if !seen[key] {
+				items = append(items, item)
+				seen[key] = true
+			}
+		}
+	}
+	writeOnlineJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func searchOnlineProvider(r *http.Request, provider, query string, limit int) ([]onlineSong, error) {
+	switch provider {
+	case "qq":
+		return searchQQ(r, query, limit)
+	case "kugou":
+		return searchKugou(r, query, limit)
+	default:
+		return searchNetease(r, query, limit)
+	}
+}
+
+func searchNetease(r *http.Request, query string, limit int) ([]onlineSong, error) {
 	requestPayload := map[string]any{
 		"s": query, "type": 1, "limit": limit, "offset": 0, "total": true,
 		"header": map[string]any{"os": "pc", "appver": "3.1.19.204510", "requestId": "0", "deviceId": fmt.Sprintf("%x", md5.Sum([]byte(query+time.Now().String()))), "MUSIC_U": ""},
@@ -75,8 +126,7 @@ func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := neteaseEAPIRequest(r, "/api/cloudsearch/pc", requestPayload)
 	if err != nil {
-		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": "online search failed"})
-		return
+		return nil, err
 	}
 	var payload struct {
 		Result struct {
@@ -105,8 +155,7 @@ func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if decoder.Decode(&payload) != nil {
-		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid search response"})
-		return
+		return nil, fmt.Errorf("invalid search response")
 	}
 	items := make([]onlineSong, 0, len(payload.Result.Songs))
 	for _, song := range payload.Result.Songs {
@@ -127,9 +176,85 @@ func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 		if duration == 0 {
 			duration = song.DT
 		}
-		items = append(items, onlineSong{ID: song.ID.String(), Title: song.Name, Artist: strings.Join(artists, ", "), Album: album, Cover: cover, Duration: duration})
+		items = append(items, onlineSong{ID: song.ID.String(), Title: song.Name, Artist: strings.Join(artists, ", "), Album: album, Cover: cover, Duration: duration, Provider: "netease"})
 	}
-	writeOnlineJSON(w, http.StatusOK, map[string]any{"items": items})
+	return items, nil
+}
+
+func searchQQ(r *http.Request, query string, limit int) ([]onlineSong, error) {
+	payload := map[string]any{"comm": map[string]string{"ct": "19", "cv": "1859", "uin": "0"}, "req_1": map[string]any{"method": "DoSearchForQQMusicDesktop", "module": "music.search.SearchCgiService", "param": map[string]any{"grp": 1, "num_per_page": limit, "page_num": 1, "query": query, "search_type": 0}}}
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://u6.y.qq.com/cgi-bin/musicu.fcg", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := onlineMusicClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var data struct {
+		Req struct {
+			Data struct {
+				Body struct {
+					Song struct {
+						List []struct {
+							Mid, Name string
+							Singer    []struct{ Name string }
+							Album     struct{ Name, Mid string }
+							Interval  int64
+						} `json:"list"`
+					} `json:"song"`
+				} `json:"body"`
+			} `json:"data"`
+		} `json:"req_1"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&data) != nil {
+		return nil, fmt.Errorf("invalid QQ response")
+	}
+	items := []onlineSong{}
+	for _, song := range data.Req.Data.Body.Song.List {
+		artists := []string{}
+		for _, a := range song.Singer {
+			artists = append(artists, a.Name)
+		}
+		cover := ""
+		if song.Album.Mid != "" {
+			cover = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + song.Album.Mid + ".jpg"
+		}
+		items = append(items, onlineSong{ID: song.Mid, Title: song.Name, Artist: strings.Join(artists, ", "), Album: song.Album.Name, Cover: cover, Duration: song.Interval * 1000, Provider: "qq"})
+	}
+	return items, nil
+}
+
+func searchKugou(r *http.Request, query string, limit int) ([]onlineSong, error) {
+	endpoint := "https://songsearch.kugou.com/song_search_v2?format=json&platform=WebFilter&page=1&pagesize=" + strconv.Itoa(limit) + "&keyword=" + url.QueryEscape(query)
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := onlineMusicClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var data struct {
+		Data struct {
+			Lists []struct {
+				FileHash, SongName, SingerName, AlbumName string
+				Duration                                  int64
+				Trans                                     struct {
+					Cover string `json:"union_cover"`
+				} `json:"trans_param"`
+			} `json:"lists"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&data) != nil {
+		return nil, fmt.Errorf("invalid Kugou response")
+	}
+	items := []onlineSong{}
+	for _, song := range data.Data.Lists {
+		cover := strings.ReplaceAll(song.Trans.Cover, "{size}", "400")
+		items = append(items, onlineSong{ID: song.FileHash, Title: song.SongName, Artist: song.SingerName, Album: song.AlbumName, Cover: cover, Duration: song.Duration * 1000, Provider: "kugou"})
+	}
+	return items, nil
 }
 
 func neteaseEAPIRequest(r *http.Request, uri string, payload any) ([]byte, error) {
@@ -184,7 +309,53 @@ func neteaseEAPIRequest(r *http.Request, uri string, payload any) ([]byte, error
 	return decrypted, nil
 }
 
-func resolveOnlineMusicURL(ctxReq *http.Request, id string) (string, error) {
+func resolveOnlineMusicURL(ctxReq *http.Request, provider, id string) (string, error) {
+	switch provider {
+	case "qq":
+		for quality := 10; quality >= 0; quality-- {
+			endpoint := "https://api.vkeys.cn/v2/music/tencent/geturl?mid=" + url.QueryEscape(id) + "&quality=" + strconv.Itoa(quality)
+			req, _ := http.NewRequestWithContext(ctxReq.Context(), http.MethodGet, endpoint, nil)
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+			resp, err := onlineMusicClient.Do(req)
+			if err != nil {
+				continue
+			}
+			var data struct {
+				Code int
+				Data struct {
+					URL string `json:"url"`
+				} `json:"data"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&data)
+			resp.Body.Close()
+			if decodeErr == nil && strings.HasPrefix(data.Data.URL, "http") {
+				return data.Data.URL, nil
+			}
+		}
+		return "", fmt.Errorf("QQ play URL unavailable")
+	case "kugou":
+		for _, base := range []string{"https://musicapi.haitangw.net/kgqq/kg.php", "https://music.haitangw.cc/kgqq/kg.php"} {
+			for _, level := range []string{"hires", "lossless", "exhigh"} {
+				endpoint := base + "?type=json&id=" + url.QueryEscape(id) + "&level=" + level
+				req, _ := http.NewRequestWithContext(ctxReq.Context(), http.MethodGet, endpoint, nil)
+				resp, err := onlineMusicClient.Do(req)
+				if err != nil {
+					continue
+				}
+				var data struct {
+					Data struct {
+						URL string `json:"url"`
+					} `json:"data"`
+				}
+				decodeErr := json.NewDecoder(resp.Body).Decode(&data)
+				resp.Body.Close()
+				if decodeErr == nil && strings.HasPrefix(data.Data.URL, "http") {
+					return data.Data.URL, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("Kugou play URL unavailable")
+	}
 	endpoint := "https://api.qijieya.cn/meting/?server=netease&type=url&id=" + url.QueryEscape(id) + "&br=320"
 	req, _ := http.NewRequestWithContext(ctxReq.Context(), http.MethodGet, endpoint, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -229,7 +400,7 @@ func resolveOnlineMusicURL(ctxReq *http.Request, id string) (string, error) {
 }
 
 func onlineMusicStream(w http.ResponseWriter, r *http.Request) {
-	mediaURL, err := resolveOnlineMusicURL(r, r.URL.Query().Get("id"))
+	mediaURL, err := resolveOnlineMusicURL(r, r.URL.Query().Get("provider"), r.URL.Query().Get("id"))
 	if err != nil {
 		http.Error(w, "stream unavailable", http.StatusBadGateway)
 		return
@@ -254,7 +425,58 @@ func onlineMusicStream(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func fetchOnlineLyrics(r *http.Request, id string) (string, error) {
+func fetchOnlineLyrics(r *http.Request, provider, id string) (string, error) {
+	if provider == "qq" {
+		endpoint := "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=" + url.QueryEscape(id) + "&g_tk=5381&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&platform=yqq"
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+		req.Header.Set("Referer", "https://y.qq.com/portal/player.html")
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := onlineMusicClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		var data struct {
+			Lyric string `json:"lyric"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&data) != nil {
+			return "", fmt.Errorf("QQ lyrics unavailable")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(data.Lyric)
+		return string(decoded), err
+	}
+	if provider == "kugou" {
+		searchURL := "http://lyrics.kugou.com/search?duration=-1&hash=" + url.QueryEscape(id)
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, searchURL, nil)
+		resp, err := onlineMusicClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		var search struct {
+			Candidates []struct{ ID, AccessKey string } `json:"candidates"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&search)
+		resp.Body.Close()
+		if decodeErr != nil || len(search.Candidates) == 0 {
+			return "", fmt.Errorf("Kugou lyrics unavailable")
+		}
+		candidate := search.Candidates[0]
+		downloadURL := "http://lyrics.kugou.com/download?ver=1&client=pc&fmt=lrc&charset=utf8&id=" + url.QueryEscape(candidate.ID) + "&accesskey=" + url.QueryEscape(candidate.AccessKey)
+		req, _ = http.NewRequestWithContext(r.Context(), http.MethodGet, downloadURL, nil)
+		resp, err = onlineMusicClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		var lyric struct {
+			Content string `json:"content"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&lyric) != nil {
+			return "", fmt.Errorf("Kugou lyrics unavailable")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(lyric.Content)
+		return string(decoded), err
+	}
 	endpoint := "https://music.163.com/api/song/lyric?id=" + url.QueryEscape(id) + "&lv=-1&kv=-1&tv=-1"
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -275,7 +497,7 @@ func fetchOnlineLyrics(r *http.Request, id string) (string, error) {
 }
 
 func onlineMusicLyrics(w http.ResponseWriter, r *http.Request) {
-	lyrics, err := fetchOnlineLyrics(r, r.URL.Query().Get("id"))
+	lyrics, err := fetchOnlineLyrics(r, r.URL.Query().Get("provider"), r.URL.Query().Get("id"))
 	if err != nil {
 		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -289,7 +511,7 @@ func onlineMusicImport(w http.ResponseWriter, r *http.Request) {
 		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid song"})
 		return
 	}
-	mediaURL, err := resolveOnlineMusicURL(r, song.ID)
+	mediaURL, err := resolveOnlineMusicURL(r, song.Provider, song.ID)
 	if err != nil {
 		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -334,7 +556,7 @@ func onlineMusicImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lyricsSaved := false
-	if lyrics, lyricErr := fetchOnlineLyrics(r, song.ID); lyricErr == nil && strings.TrimSpace(lyrics) != "" {
+	if lyrics, lyricErr := fetchOnlineLyrics(r, song.Provider, song.ID); lyricErr == nil && strings.TrimSpace(lyrics) != "" {
 		lyricsSaved = os.WriteFile(base+".lrc", []byte(lyrics), 0644) == nil
 	}
 	writeOnlineJSON(w, http.StatusOK, map[string]any{"ok": true, "file": filepath.Join(artist, album, title+ext), "lyricsSaved": lyricsSaved})
