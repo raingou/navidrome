@@ -173,6 +173,24 @@ var _ = Describe("Decider", func() {
 				Expect(decision.CanDirectPlay).To(BeTrue())
 			})
 
+			It("transcodes raw AAC when the browser only supports AAC in MP4", func() {
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "aac", Codec: "AAC", BitRate: 256, Channels: 2})
+				ci := &ClientInfo{
+					DirectPlayProfiles: []DirectPlayProfile{
+						{Containers: []string{"mp4"}, AudioCodecs: []string{"aac"}, Protocols: []string{ProtocolHTTP}},
+					},
+					TranscodingProfiles: []Profile{
+						{Container: "mp3", AudioCodec: "mp3", Protocol: ProtocolHTTP},
+					},
+				}
+				decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(decision.CanDirectPlay).To(BeFalse())
+				Expect(decision.CanTranscode).To(BeTrue())
+				Expect(decision.TargetFormat).To(Equal("mp3"))
+				Expect(decision.TranscodeReasons).To(ContainElement(ContainSubstring("raw AAC")))
+			})
+
 			It("handles container aliases (opus -> ogg)", func() {
 				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "opus", Codec: "Opus", BitRate: 165, Channels: 2, SampleRate: 48000})
 				ci := &ClientInfo{
