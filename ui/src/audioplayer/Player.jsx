@@ -7,6 +7,7 @@ import {
   createMuiTheme,
   useAuthState,
   useDataProvider,
+  useNotify,
   useTranslate,
 } from 'react-admin'
 import ReactGA from 'react-ga'
@@ -34,12 +35,14 @@ import { keyMap } from '../hotkeys'
 import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import { detectBrowserProfile, decisionService } from '../transcode'
+import httpClient from '../dataProvider/httpClient'
 
 const Player = () => {
   const theme = useCurrentTheme()
   const translate = useTranslate()
   const playerTheme = theme.player?.theme || 'dark'
   const dataProvider = useDataProvider()
+  const notify = useNotify()
   const playerState = useSelector((state) => state.player)
   const dispatch = useDispatch()
   const [currentTrackId, setCurrentTrackId] = useState(null)
@@ -47,6 +50,7 @@ const Player = () => {
   const lastPositionMsRef = useRef(0)
   const currentTrackIdRef = useRef(null)
   const stoppedRef = useRef(false)
+  const attemptedLyricsRef = useRef(new Set())
   const [audioInstance, setAudioInstance] = useState(null)
   const isDesktop = useMediaQuery('(min-width:810px)')
   const isMobilePlayer =
@@ -265,7 +269,7 @@ const Player = () => {
 
   const onAudioProgress = useCallback((info) => {
     if (info.ended) {
-      document.title = 'Navidrome'
+      document.title = '音乐'
     }
     if (!info.isRadio && info.currentTime != null) {
       lastPositionMsRef.current = Math.floor(info.currentTime * 1000)
@@ -287,7 +291,7 @@ const Player = () => {
       dispatch(currentPlaying(info))
       if (info.duration) {
         const song = info.song
-        document.title = `${song.title} - ${song.artist} - Navidrome`
+        document.title = `${song.title} - ${song.artist} - 音乐`
         if (!info.isRadio) {
           const posMs = Math.floor(info.currentTime * 1000)
           lastPositionMsRef.current = posMs
@@ -303,6 +307,30 @@ const Player = () => {
             subsonic.reportPlayback(info.trackId, posMs, 'playing')
           }
           setHeartbeatTrackId(info.trackId)
+          if (!info.lyric && !attemptedLyricsRef.current.has(info.trackId)) {
+            attemptedLyricsRef.current.add(info.trackId)
+            httpClient('/api/online-music/auto-lyrics', {
+              method: 'POST',
+              headers: new Headers({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ songId: info.trackId }),
+            })
+              .then((response) => {
+                const lrc = response.json?.lrc
+                if (!lrc) return
+                const updatedQueue = playerStateRef.current.queue.map((item) =>
+                  item.trackId === info.trackId
+                    ? { ...item, lyric: lrc }
+                    : item,
+                )
+                dispatch(syncQueue({ ...info, lyric: lrc }, updatedQueue))
+                notify('已自动找到并保存歌词', 'info')
+              })
+              .catch((error) => {
+                if (error?.status === 422) {
+                  notify(error.message, 'warning')
+                }
+              })
+          }
         }
         if (config.gaTrackingId) {
           ReactGA.event({
@@ -320,7 +348,7 @@ const Player = () => {
         }
       }
     },
-    [context, dispatch, showNotifications, currentTrackId],
+    [context, dispatch, showNotifications, currentTrackId, notify],
   )
 
   const onAudioPlayTrackChange = useCallback(() => {
@@ -410,7 +438,7 @@ const Player = () => {
   }, [dispatch, currentTrackId])
 
   if (!visible) {
-    document.title = 'Navidrome'
+    document.title = '音乐'
   }
 
   const handlers = useMemo(
