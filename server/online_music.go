@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -770,10 +771,7 @@ func downloadOnlineSong(r *http.Request, song importOnlineSongRequest, reportPro
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("download source rejected request")
 	}
-	ext := filepath.Ext(strings.Split(mediaURL, "?")[0])
-	if ext == "" || len(ext) > 6 {
-		ext = ".mp3"
-	}
+	ext := onlineAudioExtension(mediaURL, resp.Header.Get("Content-Type"))
 	base := filepath.Join(directory, title)
 	temporary := base + ext + ".part"
 	file, err := os.Create(temporary)
@@ -820,6 +818,33 @@ func downloadOnlineSong(r *http.Request, song importOnlineSongRequest, reportPro
 		lyricsSaved = os.WriteFile(base+".lrc", []byte(lyrics), 0644) == nil
 	}
 	return map[string]any{"ok": true, "file": filepath.Join(artist, album, title+ext), "lyricsSaved": lyricsSaved}, nil
+}
+
+func onlineAudioExtension(mediaURL, contentType string) string {
+	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
+		if ext := map[string]string{
+			"audio/aac":    ".aac",
+			"audio/aacp":   ".aac",
+			"audio/mp4":    ".m4a",
+			"audio/x-m4a":  ".m4a",
+			"audio/mpeg":   ".mp3",
+			"audio/flac":   ".flac",
+			"audio/x-flac": ".flac",
+			"audio/ogg":    ".ogg",
+			"audio/opus":   ".opus",
+			"audio/wav":    ".wav",
+			"audio/x-wav":  ".wav",
+		}[strings.ToLower(parsed)]; ext != "" {
+			return ext
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(strings.Split(mediaURL, "?")[0]))
+	for _, supported := range []string{".aac", ".m4a", ".mp3", ".flac", ".ogg", ".opus", ".wav"} {
+		if ext == supported {
+			return ext
+		}
+	}
+	return ".mp3"
 }
 
 func safeOnlineName(value, fallback string) string {
