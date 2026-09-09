@@ -26,6 +26,7 @@ import {
   TableHead,
   TableRow,
   Select,
+  LinearProgress,
 } from '@material-ui/core'
 import CloseIcon from '@material-ui/icons/Close'
 import SearchIcon from '@material-ui/icons/Search'
@@ -33,6 +34,8 @@ import PlayArrowIcon from '@material-ui/icons/PlayArrow'
 import StopIcon from '@material-ui/icons/Stop'
 import GetAppIcon from '@material-ui/icons/GetApp'
 import ViewListIcon from '@material-ui/icons/ViewList'
+import CheckCircleIcon from '@material-ui/icons/CheckCircle'
+import ErrorIcon from '@material-ui/icons/Error'
 import { Dialogs } from '../dialogs/Dialogs'
 import { AboutDialog } from '../dialogs'
 import PersonalMenu from './PersonalMenu'
@@ -45,6 +48,17 @@ import { baseUrl } from '../utils'
 
 const useStyles = makeStyles(
   (theme) => ({
+    '@global': {
+      '[class*="RaSearchInput-input"] .MuiOutlinedInput-root': {
+        minHeight: 38,
+        borderRadius: 19,
+        backgroundColor: theme.palette.action.hover,
+      },
+      '[class*="RaSearchInput-input"] .MuiOutlinedInput-input': {
+        paddingTop: 9,
+        paddingBottom: 9,
+      },
+    },
     root: {
       color: theme.palette.text.secondary,
     },
@@ -86,18 +100,28 @@ const useStyles = makeStyles(
     onlineContent: { padding: 0, overflow: 'auto' },
     onlineCover: { width: 42, height: 42, borderRadius: 4, objectFit: 'cover' },
     onlineActions: { whiteSpace: 'nowrap' },
+    downloadProgress: {
+      width: 118,
+      display: 'inline-block',
+      verticalAlign: 'middle',
+    },
+    localRow: { backgroundColor: theme.palette.action.selected },
+    sectionRow: {
+      fontWeight: 600,
+      backgroundColor: theme.palette.background.default,
+    },
     onlineMessage: { padding: theme.spacing(4), textAlign: 'center' },
     headerLayout: {
       display: 'grid',
       gridTemplateColumns: (props) =>
         props.sidebarOpen
-          ? '290px minmax(300px, 420px) minmax(40px, 1fr)'
-          : '40px minmax(300px, 420px) minmax(40px, 1fr)',
+          ? '184px minmax(300px, 420px) minmax(40px, 1fr)'
+          : '112px minmax(260px, 420px) minmax(40px, 1fr)',
       alignItems: 'center',
       flex: 1,
       minWidth: 0,
       [theme.breakpoints.down('sm')]: {
-        gridTemplateColumns: '60px minmax(150px, 1fr) 8px',
+        gridTemplateColumns: '82px minmax(150px, 1fr) 8px',
       },
     },
     systemName: {
@@ -122,7 +146,7 @@ const OnlineMusicSearch = () => {
   const [items, setItems] = React.useState([])
   const [error, setError] = React.useState('')
   const [playingId, setPlayingId] = React.useState(null)
-  const [importingId, setImportingId] = React.useState(null)
+  const [downloadStates, setDownloadStates] = React.useState({})
   const audio = React.useRef(null)
 
   const search = async (event) => {
@@ -172,19 +196,41 @@ const OnlineMusicSearch = () => {
     })
   }
 
+  const itemKey = (item) => `${item.provider}:${item.id}`
+
   const importSong = async (item) => {
-    setImportingId(item.id)
+    const key = itemKey(item)
+    setDownloadStates((current) => ({
+      ...current,
+      [key]: { status: 'preparing', progress: 2 },
+    }))
     setError('')
     try {
-      await httpClient('/api/online-music/import', {
+      const started = await httpClient('/api/online-music/import/start', {
         method: 'POST',
         body: JSON.stringify(item),
         headers: new Headers({ 'Content-Type': 'application/json' }),
       })
+      const jobId = started.json?.jobId
+      if (!jobId) throw new Error('无法启动下载任务')
+      let finished = false
+      while (!finished) {
+        await new Promise((resolve) => setTimeout(resolve, 700))
+        const response = await httpClient(
+          `/api/online-music/import/status/${jobId}`,
+        )
+        const state = response.json || {}
+        setDownloadStates((current) => ({ ...current, [key]: state }))
+        finished = state.status === 'completed' || state.status === 'failed'
+        if (state.status === 'failed')
+          throw new Error(state.error || '下载失败')
+      }
     } catch (importError) {
+      setDownloadStates((current) => ({
+        ...current,
+        [key]: { status: 'failed', error: importError?.message || '下载失败' },
+      }))
       setError(importError?.message || '下载入库失败，请检查音乐目录写入权限')
-    } finally {
-      setImportingId(null)
     }
   }
 
@@ -237,29 +283,151 @@ const OnlineMusicSearch = () => {
         </div>
         <DialogContent className={classes.onlineContent}>
           {loading ? (
-            <div className={classes.onlineMessage}><CircularProgress /></div>
+            <div className={classes.onlineMessage}>
+              <CircularProgress />
+            </div>
           ) : error && items.length === 0 ? (
             <div className={classes.onlineMessage}>{error}</div>
           ) : items.length === 0 ? (
             <div className={classes.onlineMessage}>没有找到相关歌曲</div>
           ) : (
             <Table stickyHeader size="small">
-              <TableHead><TableRow><TableCell>封面</TableCell><TableCell>歌曲</TableCell><TableCell>歌手</TableCell><TableCell>专辑</TableCell><TableCell>来源</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
+              <TableHead>
+                <TableRow>
+                  <TableCell>封面</TableCell>
+                  <TableCell>歌曲</TableCell>
+                  <TableCell>歌手</TableCell>
+                  <TableCell>专辑</TableCell>
+                  <TableCell>来源</TableCell>
+                  <TableCell align="right">操作</TableCell>
+                </TableRow>
+              </TableHead>
               <TableBody>
-                {items.map((item) => (
-                  <TableRow hover key={item.id}>
-                    <TableCell>{item.cover ? <img className={classes.onlineCover} src={item.cover} alt="" /> : null}</TableCell>
-                    <TableCell>{item.title}</TableCell><TableCell>{item.artist}</TableCell><TableCell>{item.album}</TableCell><TableCell>{{ netease: '网易云', qq: 'QQ音乐', kugou: '酷狗' }[item.provider] || item.provider}</TableCell>
-                    <TableCell align="right" className={classes.onlineActions}>
-                      <Tooltip title={playingId === item.id ? '停止试听' : '在线试听'}><IconButton onClick={() => togglePlay(item)}>{playingId === item.id ? <StopIcon /> : <PlayArrowIcon />}</IconButton></Tooltip>
-                      <Button size="small" startIcon={importingId === item.id ? <CircularProgress size={16} /> : <GetAppIcon />} disabled={importingId !== null} onClick={() => importSong(item)}>下载入库</Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {items.map((item, index) => {
+                  const state = downloadStates[itemKey(item)] || {}
+                  const firstOnline =
+                    index > 0 && !item.local && items[index - 1]?.local
+                  return (
+                    <React.Fragment key={itemKey(item)}>
+                      {index === 0 && item.local ? (
+                        <TableRow>
+                          <TableCell className={classes.sectionRow} colSpan={6}>
+                            本地音乐（已存在，无需重复下载）
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
+                      {firstOnline ? (
+                        <TableRow>
+                          <TableCell className={classes.sectionRow} colSpan={6}>
+                            在线音乐来源
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
+                      <TableRow
+                        hover
+                        className={item.local ? classes.localRow : undefined}
+                      >
+                        <TableCell>
+                          {item.cover ? (
+                            <img
+                              className={classes.onlineCover}
+                              src={item.cover}
+                              alt=""
+                            />
+                          ) : null}
+                        </TableCell>
+                        <TableCell>{item.title}</TableCell>
+                        <TableCell>{item.artist}</TableCell>
+                        <TableCell>{item.album}</TableCell>
+                        <TableCell>
+                          {{
+                            local: '本地音乐',
+                            netease: '网易云',
+                            qq: 'QQ音乐',
+                            kugou: '酷狗',
+                          }[item.provider] || item.provider}
+                        </TableCell>
+                        <TableCell
+                          align="right"
+                          className={classes.onlineActions}
+                        >
+                          {!item.local ? (
+                            <Tooltip
+                              title={
+                                playingId === item.id ? '停止试听' : '在线试听'
+                              }
+                            >
+                              <IconButton onClick={() => togglePlay(item)}>
+                                {playingId === item.id ? (
+                                  <StopIcon />
+                                ) : (
+                                  <PlayArrowIcon />
+                                )}
+                              </IconButton>
+                            </Tooltip>
+                          ) : null}
+                          {item.local ? (
+                            <Button
+                              size="small"
+                              disabled
+                              startIcon={<CheckCircleIcon />}
+                            >
+                              本地已有
+                            </Button>
+                          ) : state.status === 'downloading' ||
+                            state.status === 'preparing' ? (
+                            <span className={classes.downloadProgress}>
+                              <LinearProgress
+                                variant={
+                                  state.progress
+                                    ? 'determinate'
+                                    : 'indeterminate'
+                                }
+                                value={state.progress || 0}
+                              />
+                              <small>
+                                {state.status === 'preparing'
+                                  ? '准备下载…'
+                                  : `下载中 ${state.progress || 0}%`}
+                              </small>
+                            </span>
+                          ) : state.status === 'completed' ? (
+                            <Button
+                              size="small"
+                              disabled
+                              startIcon={<CheckCircleIcon />}
+                            >
+                              下载完成
+                            </Button>
+                          ) : state.status === 'failed' ? (
+                            <Button
+                              size="small"
+                              color="secondary"
+                              startIcon={<ErrorIcon />}
+                              onClick={() => importSong(item)}
+                            >
+                              失败，重试
+                            </Button>
+                          ) : (
+                            <Button
+                              size="small"
+                              startIcon={<GetAppIcon />}
+                              onClick={() => importSong(item)}
+                            >
+                              下载入库
+                            </Button>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    </React.Fragment>
+                  )
+                })}
               </TableBody>
             </Table>
           )}
-          {error && items.length > 0 ? <div className={classes.onlineMessage}>{error}</div> : null}
+          {error && items.length > 0 ? (
+            <div className={classes.onlineMessage}>{error}</div>
+          ) : null}
         </DialogContent>
       </Dialog>
     </>
@@ -385,11 +553,7 @@ const CustomUserMenu = ({ onClick, ...rest }) => {
 }
 
 const AppBar = (props) => (
-  <RAAppBar
-    {...props}
-    container={Fragment}
-    userMenu={<CustomUserMenu />}
-  >
+  <RAAppBar {...props} container={Fragment} userMenu={<CustomUserMenu />}>
     <HeaderContent />
   </RAAppBar>
 )
