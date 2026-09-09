@@ -52,6 +52,7 @@ const Player = () => {
   const stoppedRef = useRef(false)
   const attemptedLyricsRef = useRef(new Set())
   const [audioInstance, setAudioInstance] = useState(null)
+  const [lyricsRefresh, setLyricsRefresh] = useState(false)
   const isDesktop = useMediaQuery('(min-width:810px)')
   const isMobilePlayer =
     /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
@@ -224,7 +225,7 @@ const Player = () => {
       showThemeSwitch: false,
       showMediaSession: true,
       restartCurrentOnPrev: true,
-      quietUpdate: true,
+      quietUpdate: !lyricsRefresh,
       defaultPosition: {
         top: 300,
         left: 120,
@@ -240,7 +241,14 @@ const Player = () => {
       locale: locale(translate),
       sortableOptions: { delay: 200, delayOnTouchOnly: true },
     }),
-    [gainInfo, isDesktop, playerTheme, translate, playerState.mode],
+    [
+      gainInfo,
+      isDesktop,
+      playerTheme,
+      translate,
+      playerState.mode,
+      lyricsRefresh,
+    ],
   )
 
   const options = useMemo(() => {
@@ -322,7 +330,18 @@ const Player = () => {
                     ? { ...item, lyric: lrc }
                     : item,
                 )
+                const resumeAt = audioInstance?.currentTime || 0
+                const resumePlaying = audioInstance && !audioInstance.paused
+                setLyricsRefresh(true)
                 dispatch(syncQueue({ ...info, lyric: lrc }, updatedQueue))
+                dispatch(refreshQueue())
+                setTimeout(() => {
+                  if (audioInstance && resumeAt > 0) {
+                    audioInstance.currentTime = resumeAt
+                    if (resumePlaying) audioInstance.play().catch(() => {})
+                  }
+                  setLyricsRefresh(false)
+                }, 500)
                 notify('已自动找到并保存歌词', 'info')
               })
               .catch((error) => {
@@ -348,7 +367,14 @@ const Player = () => {
         }
       }
     },
-    [context, dispatch, showNotifications, currentTrackId, notify],
+    [
+      context,
+      dispatch,
+      showNotifications,
+      currentTrackId,
+      notify,
+      audioInstance,
+    ],
   )
 
   const onAudioPlayTrackChange = useCallback(() => {
