@@ -199,6 +199,18 @@ func matchesPCMWAVBridge(src *Details, profile *DirectPlayProfile) bool {
 		containsIgnoreCase(profile.AudioCodecs, "wav")
 }
 
+// Raw AAC/ADTS and AAC inside MP4 use the same codec but are different byte
+// streams. Browsers commonly advertise audio/mp4 AAC support while rejecting
+// raw ADTS. Do not let the broad AAC container alias group turn that MP4-only
+// capability into raw AAC direct play.
+func rawAACRequiresExplicitContainer(src *Details, profile *DirectPlayProfile) bool {
+	rawAAC := strings.EqualFold(src.Container, "aac") || strings.EqualFold(src.Container, "adts")
+	if !rawAAC || len(profile.Containers) == 0 {
+		return false
+	}
+	return !containsIgnoreCase(profile.Containers, "aac") && !containsIgnoreCase(profile.Containers, "adts")
+}
+
 // checkDirectPlayProfile returns "" if the profile matches (direct play OK),
 // or a typed reason string if it doesn't match.
 func (s *deciderService) checkDirectPlayProfile(src *Details, profile *DirectPlayProfile, clientInfo *ClientInfo) string {
@@ -210,6 +222,9 @@ func (s *deciderService) checkDirectPlayProfile(src *Details, profile *DirectPla
 	// Check container
 	if len(profile.Containers) > 0 && !matchesContainer(src.Container, profile.Containers) {
 		return fmt.Sprintf("container '%s' not supported by profile %s", src.Container, profile)
+	}
+	if rawAACRequiresExplicitContainer(src, profile) {
+		return fmt.Sprintf("raw AAC container '%s' not supported by MP4-only profile %s", src.Container, profile)
 	}
 
 	// Check codec
