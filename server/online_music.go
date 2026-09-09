@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +34,18 @@ var onlineMusicClient = &http.Client{
 }
 var unsafeFilenameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 var playlistMatchSeparators = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+var onlineDownloadJobs = struct {
+	sync.RWMutex
+	items map[string]onlineDownloadJob
+}{items: map[string]onlineDownloadJob{}}
+
+type onlineDownloadJob struct {
+	Status      string `json:"status"`
+	Progress    int    `json:"progress"`
+	File        string `json:"file,omitempty"`
+	LyricsSaved bool   `json:"lyricsSaved,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
 
 type onlineSong struct {
 	ID       string `json:"id"`
@@ -41,6 +55,7 @@ type onlineSong struct {
 	Cover    string `json:"cover,omitempty"`
 	Duration int64  `json:"duration,omitempty"`
 	Provider string `json:"provider"`
+	Local    bool   `json:"local,omitempty"`
 }
 
 type importOnlineSongRequest struct {
@@ -64,10 +79,13 @@ type playlistImportRequest struct {
 
 func (s *Server) MountOnlineMusicRouter() {
 	router := chi.NewRouter()
-	router.Get("/search", onlineMusicSearch)
+	router.Get("/search", s.onlineMusicSearch)
 	router.Get("/stream", onlineMusicStream)
 	router.Get("/lyrics", onlineMusicLyrics)
 	router.Post("/import", onlineMusicImport)
+	router.Post("/import/start", onlineMusicImportStart)
+	router.Get("/import/status/{id}", onlineMusicImportStatus)
+	router.Post("/auto-lyrics", s.onlineAutoLyrics)
 	router.Post("/playlist-match", s.onlinePlaylistMatch)
 	router.Post("/playlist-import", onlinePlaylistImport)
 	s.router.Group(func(r chi.Router) {
@@ -169,7 +187,7 @@ func onlinePlaylistImport(w http.ResponseWriter, r *http.Request) {
 	writeOnlineJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name, "tracks": count, "file": filepath.ToSlash(filepath.Join("Imported Playlists", name+".m3u8"))})
 }
 
-func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
+func (s *Server) onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
 		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "missing query"})
@@ -200,18 +218,33 @@ func onlineMusicSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	wait.Wait()
 	close(results)
-	items := make([]onlineSong, 0, limit*len(providers))
+	items := make([]onlineSong, 0, limit*(len(providers)+1))
 	seen := map[string]bool{}
+	localItems, localErr := s.ds.MediaFile(r.Context()).Search(query, model.QueryOptions{Max: limit})
+	if localErr == nil {
+		for _, song := range localItems {
+			item := onlineSong{ID: song.ID, Title: song.Title, Artist: song.Artist, Album: song.Album, Duration: int64(song.Duration * 1000), Provider: "local", Local: true}
+			items = append(items, item)
+			seen[onlineSongIdentity(item)] = true
+		}
+	}
 	for result := range results {
 		for _, item := range result.items {
-			key := item.Provider + "|" + strings.ToLower(strings.TrimSpace(item.Title)) + "|" + strings.ToLower(strings.TrimSpace(item.Artist))
+			key := onlineSongIdentity(item)
 			if !seen[key] {
 				items = append(items, item)
 				seen[key] = true
 			}
 		}
 	}
-	writeOnlineJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeOnlineJSON(w, http.StatusOK, map[string]any{"items": items, "localCount": len(localItems)})
+}
+
+func onlineSongIdentity(item onlineSong) string {
+	normalize := func(value string) string {
+		return strings.Join(strings.Fields(playlistMatchSeparators.ReplaceAllString(strings.ToLower(value), " ")), " ")
+	}
+	return normalize(item.Title) + "|" + normalize(item.Artist)
 }
 
 func searchOnlineProvider(r *http.Request, provider, query string, limit int) ([]onlineSong, error) {
@@ -618,26 +651,124 @@ func onlineMusicImport(w http.ResponseWriter, r *http.Request) {
 		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid song"})
 		return
 	}
-	mediaURL, err := resolveOnlineMusicURL(r, song.Provider, song.ID)
+	result, err := downloadOnlineSong(r, song, nil)
 	if err != nil {
 		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
+	writeOnlineJSON(w, http.StatusOK, result)
+}
+
+func onlineMusicImportStart(w http.ResponseWriter, r *http.Request) {
+	var song importOnlineSongRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&song) != nil || song.ID == "" || song.Provider == "local" {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid song"})
+		return
+	}
+	random := make([]byte, 12)
+	_, _ = rand.Read(random)
+	jobID := hex.EncodeToString(random)
+	setOnlineDownloadJob(jobID, onlineDownloadJob{Status: "preparing", Progress: 2})
+	backgroundRequest := r.Clone(context.Background())
+	go func() {
+		result, err := downloadOnlineSong(backgroundRequest, song, func(progress int) {
+			setOnlineDownloadJob(jobID, onlineDownloadJob{Status: "downloading", Progress: progress})
+		})
+		if err != nil {
+			setOnlineDownloadJob(jobID, onlineDownloadJob{Status: "failed", Error: err.Error()})
+			return
+		}
+		setOnlineDownloadJob(jobID, onlineDownloadJob{Status: "completed", Progress: 100, File: result["file"].(string), LyricsSaved: result["lyricsSaved"].(bool)})
+	}()
+	writeOnlineJSON(w, http.StatusAccepted, map[string]string{"jobId": jobID})
+}
+
+func (s *Server) onlineAutoLyrics(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		SongID string `json:"songId"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload) != nil || payload.SongID == "" {
+		writeOnlineJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid song"})
+		return
+	}
+	mediaFile, err := s.ds.MediaFile(r.Context()).Get(payload.SongID)
+	if err != nil {
+		writeOnlineJSON(w, http.StatusNotFound, map[string]string{"error": "song not found"})
+		return
+	}
+	if strings.TrimSpace(mediaFile.Title) == "" || strings.TrimSpace(mediaFile.Artist) == "" || strings.Contains(strings.ToLower(mediaFile.Artist), "unknown") {
+		writeOnlineJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "歌曲缺少完整的歌名或歌手，请先编辑音乐标签后再搜索歌词"})
+		return
+	}
+	requested := playlistImportTrack{Title: mediaFile.Title, Artist: mediaFile.Artist}
+	var best *onlineSong
+	bestScore := -1
+	for _, provider := range []string{"netease", "qq", "kugou"} {
+		items, searchErr := searchOnlineProvider(r, provider, mediaFile.Title+" "+mediaFile.Artist, 5)
+		if searchErr != nil {
+			continue
+		}
+		for i := range items {
+			score := playlistMatchScore(requested, model.MediaFile{Title: items[i].Title, Artist: items[i].Artist})
+			if score > bestScore {
+				best, bestScore = &items[i], score
+			}
+		}
+	}
+	if best == nil || bestScore < 70 {
+		writeOnlineJSON(w, http.StatusNotFound, map[string]string{"error": "网上没有找到可信的匹配歌词"})
+		return
+	}
+	lyrics, err := fetchOnlineLyrics(r, best.Provider, best.ID)
+	if err != nil || strings.TrimSpace(lyrics) == "" {
+		writeOnlineJSON(w, http.StatusNotFound, map[string]string{"error": "匹配到歌曲，但该来源没有歌词"})
+		return
+	}
+	base := strings.TrimSuffix(mediaFile.AbsolutePath(), filepath.Ext(mediaFile.AbsolutePath()))
+	if err = os.WriteFile(base+".lrc", []byte(lyrics), 0644); err != nil {
+		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "找到歌词，但音乐目录不可写"})
+		return
+	}
+	writeOnlineJSON(w, http.StatusOK, map[string]any{"ok": true, "lrc": lyrics, "provider": best.Provider})
+}
+
+func onlineMusicImportStatus(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "id")
+	onlineDownloadJobs.RLock()
+	job, ok := onlineDownloadJobs.items[jobID]
+	onlineDownloadJobs.RUnlock()
+	if !ok {
+		writeOnlineJSON(w, http.StatusNotFound, map[string]string{"error": "download job not found"})
+		return
+	}
+	writeOnlineJSON(w, http.StatusOK, job)
+}
+
+func setOnlineDownloadJob(jobID string, job onlineDownloadJob) {
+	onlineDownloadJobs.Lock()
+	onlineDownloadJobs.items[jobID] = job
+	onlineDownloadJobs.Unlock()
+}
+
+func downloadOnlineSong(r *http.Request, song importOnlineSongRequest, reportProgress func(int)) (map[string]any, error) {
+	mediaURL, err := resolveOnlineMusicURL(r, song.Provider, song.ID)
+	if err != nil {
+		return nil, err
+	}
 	artist, album, title := safeOnlineName(song.Artist, "Unknown Artist"), safeOnlineName(song.Album, "Unknown Album"), safeOnlineName(song.Title, "Unknown Title")
 	directory := filepath.Join(conf.Server.MusicFolder, artist, album)
 	if err = os.MkdirAll(directory, 0755); err != nil {
-		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "music folder is not writable"})
-		return
+		return nil, fmt.Errorf("music folder is not writable")
 	}
-	resp, err := onlineMusicClient.Get(mediaURL)
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, mediaURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := onlineMusicClient.Do(req)
 	if err != nil {
-		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": "download failed"})
-		return
+		return nil, fmt.Errorf("download failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeOnlineJSON(w, http.StatusBadGateway, map[string]string{"error": "download source rejected request"})
-		return
+		return nil, fmt.Errorf("download source rejected request")
 	}
 	ext := filepath.Ext(strings.Split(mediaURL, "?")[0])
 	if ext == "" || len(ext) > 6 {
@@ -647,7 +778,28 @@ func onlineMusicImport(w http.ResponseWriter, r *http.Request) {
 	temporary := base + ext + ".part"
 	file, err := os.Create(temporary)
 	if err == nil {
-		_, err = io.Copy(file, resp.Body)
+		var written int64
+		buffer := make([]byte, 128*1024)
+		for err == nil {
+			var read int
+			read, err = resp.Body.Read(buffer)
+			if read > 0 {
+				var saved int
+				saved, err = file.Write(buffer[:read])
+				written += int64(saved)
+				if reportProgress != nil && resp.ContentLength > 0 {
+					progress := 5 + int(float64(written)/float64(resp.ContentLength)*85)
+					if progress > 90 {
+						progress = 90
+					}
+					reportProgress(progress)
+				}
+			}
+			if err == io.EOF {
+				err = nil
+				break
+			}
+		}
 		closeErr := file.Close()
 		if err == nil {
 			err = closeErr
@@ -655,18 +807,19 @@ func onlineMusicImport(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		_ = os.Remove(temporary)
-		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "saving audio failed"})
-		return
+		return nil, fmt.Errorf("saving audio failed")
 	}
 	if err = os.Rename(temporary, base+ext); err != nil {
-		writeOnlineJSON(w, http.StatusInternalServerError, map[string]string{"error": "saving audio failed"})
-		return
+		return nil, fmt.Errorf("saving audio failed")
+	}
+	if reportProgress != nil {
+		reportProgress(94)
 	}
 	lyricsSaved := false
 	if lyrics, lyricErr := fetchOnlineLyrics(r, song.Provider, song.ID); lyricErr == nil && strings.TrimSpace(lyrics) != "" {
 		lyricsSaved = os.WriteFile(base+".lrc", []byte(lyrics), 0644) == nil
 	}
-	writeOnlineJSON(w, http.StatusOK, map[string]any{"ok": true, "file": filepath.Join(artist, album, title+ext), "lyricsSaved": lyricsSaved})
+	return map[string]any{"ok": true, "file": filepath.Join(artist, album, title+ext), "lyricsSaved": lyricsSaved}, nil
 }
 
 func safeOnlineName(value, fallback string) string {
